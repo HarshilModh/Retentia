@@ -20,4 +20,18 @@ def test_learner_concept_composite_primary_key():
 
 def test_sessions_columns():
     columns = set(Base.metadata.tables["sessions"].columns.keys())
-    assert {"user_id", "current_concept_id", "pending_question", "chat_history"}.issubset(columns)
+    assert {"user_id", "current_concept_id", "pending_question", "chat_history", "question_posed_at"}.issubset(columns)
+
+
+def test_attempts_table_and_columns():
+    assert "attempts" in Base.metadata.tables
+    columns = set(Base.metadata.tables["attempts"].columns.keys())
+    assert {
+        "id", "user_id", "concept_id", "question", "answer", "quality", "passed",
+        "misconception", "action_type", "hints_used", "response_ms", "created_at",
+    } == columns
+
+
+def test_attempts_index_on_user_concept_created():
+    indexes = Base.metadata.tables["attempts"].indexes
+    assert any([c.name for c in i.columns] == ["user_id", "concept_id", "created_at"] for i in indexes)

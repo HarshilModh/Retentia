@@ -1,6 +1,13 @@
 from datetime import datetime, timedelta, timezone
-from app.config import MASTERY_ALPHA, MASTERY_THRESHOLD, BASE_REVIEW_INTERVAL_DAYS
-from app.db.crud import get_learner_concept, upsert_learner_concept, get_all_learner_concepts
+from app.config import (
+    MASTERY_ALPHA,
+    MASTERY_THRESHOLD,
+    BASE_REVIEW_INTERVAL_DAYS,
+    BASE_FAIL_INTERVAL_DAYS,
+    PASS_THRESHOLD,
+    GRADER_CONTEXT_CHARS,
+)
+from app.db.crud import get_learner_concept, save_graded_attempt, get_all_learner_concepts
 
 
 # EMA = Exponential Moving Average.
@@ -27,59 +34,116 @@ def compute_next_review(streak: int) -> int:
     return BASE_REVIEW_INTERVAL_DAYS * (2 ** (streak - 1))
 
 
+# The grading calculation, with no database and no clock of its own: the
+# current state, the quality score and "now" go in; the new state comes out.
+# Same inputs always give the same output, so tests (and later the student
+# simulator) can call it directly. apply_grade() below is the thin wrapper
+# that reads the stored state, calls this, and saves the result.
+def compute_grade_update(
+    current: dict,
+    quality: float,
+    misconception: str | None,
+    now: datetime,
+    pass_threshold: float = PASS_THRESHOLD,
+) -> dict:
+    # Clamp first: ema() only clamps its output, so an out-of-range quality
+    # (e.g. 1.4 from the grader) would otherwise inflate mastery and pass.
+    quality = max(0.0, min(1.0, quality))
+
+    passed = quality >= pass_threshold
+    new_mastery = ema(current["mastery"], quality)
+    new_streak = current["streak"] + 1 if passed else 0
+    # Passing extends the review interval (SM-2); failing brings the concept
+    # back soon, much sooner than even a first pass would.
+    days = compute_next_review(new_streak) if passed else BASE_FAIL_INTERVAL_DAYS
+
+    # Build a new list; never change the caller's list in place.
+    misconceptions = list(current.get("misconceptions") or [])
+    if misconception:
+        misconceptions.append(misconception)
+
+    return {
+        "quality": quality,
+        "passed": passed,
+        "mastery": new_mastery,
+        "status": "mastered" if new_mastery >= MASTERY_THRESHOLD else "learning",
+        "streak": new_streak,
+        "misconceptions": misconceptions,
+        "next_review": now + timedelta(days=days),
+    }
+
+
+# How long the student took to answer, in milliseconds, measured from when the
+# question was posed to "now". Returns None when the posing time is unknown
+# (e.g. the question was posed before this was tracked), so grading never
+# fails just because of a missing timestamp.
+def compute_response_ms(posed_at_iso: str | None, now: datetime) -> int | None:
+    if not posed_at_iso:
+        return None
+    posed_at = datetime.fromisoformat(posed_at_iso)
+    return max(0, int((now - posed_at).total_seconds() * 1000))
+
+
 # The main write-back function: called after a student answers a question.
 # quality (0.0-1.0) comes from grade_answer() below.
-# This is the ONLY place mastery, streak, and next_review get updated —
-# keeping all that logic in one deterministic function (not the LLM) means
-# the same inputs always produce the same outputs, which is testable and
-# doesn't hallucinate.
-def apply_grade(user_id: str, concept_id: str, quality: float, misconception: str | None = None) -> dict:
+# This is the ONLY place mastery, streak, and next_review get updated.
+# The math itself lives in compute_grade_update() (pure, tested); this wrapper
+# only reads the stored state, calls it, and saves the result together with an
+# attempt-log row in one transaction (see crud.save_graded_attempt).
+# question/answer are what was asked and the student's own words, stored in
+# the attempt log. response_ms / hints_used / action_type are optional extras.
+def apply_grade(
+    user_id: str,
+    concept_id: str,
+    quality: float,
+    misconception: str | None = None,
+    *,
+    question: str,
+    answer: str,
+    response_ms: int | None = None,
+    hints_used: int = 0,
+    action_type: str | None = None,
+) -> dict:
     # If the student has never touched this concept before, start from defaults
     # instead of crashing on a missing row.
     current = get_learner_concept(user_id, concept_id) or {
         "mastery": 0.0, "attempts": 0, "streak": 0, "misconceptions": []
     }
+    now = datetime.now(timezone.utc)
+    update = compute_grade_update(current, quality, misconception, now)
 
-    old_mastery = current["mastery"]
-    new_mastery = ema(old_mastery, quality)
-
-    # 0.6 is the pass/fail line: at or above it counts as a correct understanding.
-    passed = quality >= 0.6
-    new_streak = current["streak"] + 1 if passed else 0
-    # Passing extends the review interval (SM-2); failing resets to a near-term
-    # review so the student sees this concept again very soon.
-    days = compute_next_review(new_streak) if passed else BASE_REVIEW_INTERVAL_DAYS
-
-    # Misconceptions accumulate over time — every wrong-answer explanation
-    # gets appended, building a history of this student's specific confusions.
-    misconceptions = current["misconceptions"] or []
-    if misconception:
-        misconceptions = misconceptions + [misconception]
-
-    status = "mastered" if new_mastery >= MASTERY_THRESHOLD else "learning"
-    next_review = datetime.now(timezone.utc) + timedelta(days=days)
-
-    # Persist everything in one upsert — this is the only place in the whole
-    # app that writes to learner_concept after a grading event.
-    upsert_learner_concept(
+    save_graded_attempt(
         user_id, concept_id,
-        mastery=new_mastery,
-        status=status,
-        attempts=current["attempts"] + 1,
-        streak=new_streak,
-        misconceptions=misconceptions,
-        last_seen=datetime.now(timezone.utc),
-        next_review=next_review,
+        progress_fields=dict(
+            mastery=update["mastery"],
+            status=update["status"],
+            attempts=current["attempts"] + 1,
+            streak=update["streak"],
+            misconceptions=update["misconceptions"],
+            last_seen=now,
+            next_review=update["next_review"],
+        ),
+        attempt_fields=dict(
+            question=question,
+            answer=answer,
+            quality=update["quality"],
+            passed=update["passed"],
+            misconception=misconception,
+            action_type=action_type,
+            hints_used=hints_used,
+            response_ms=response_ms,
+        ),
     )
 
     # Returned as a plain dict so the agent tool (in tutor.py) can hand this
     # straight back to the LLM as a tool result, no extra conversion needed.
     return {
-        "old_mastery": old_mastery,
-        "new_mastery": new_mastery,
-        "status": status,
-        "streak": new_streak,
-        "next_review": next_review.isoformat(),
+        "quality": update["quality"],
+        "old_mastery": current["mastery"],
+        "new_mastery": update["mastery"],
+        "status": update["status"],
+        "streak": update["streak"],
+        "next_review": update["next_review"].isoformat(),
     }
 
 
@@ -125,12 +189,36 @@ def select_next_concept(user_id: str) -> dict | None:
     return None
 
 
+# Join retrieved course passages into one block for the grader, cutting it off
+# at max_chars so the prompt (and token use) stays bounded. Empty in, empty out.
+def build_grader_reference(passages: list[str], max_chars: int = GRADER_CONTEXT_CHARS) -> str:
+    return "\n\n".join(p for p in passages if p)[:max_chars]
+
+
+# The grader prompt, kept separate from the LLM call so it can be tested.
+# reference (course content) is optional: with none, the grader works from the
+# concept summary alone, exactly as before.
+def build_grade_prompt(title: str, summary: str, question: str, answer: str, reference: str = "") -> str:
+    prompt = (
+        f"You are grading a student's answer about '{title}'.\n"
+        f"Concept summary: {summary}\n"
+    )
+    if reference:
+        prompt += f"Course material for this concept:\n{reference}\n"
+    prompt += (
+        f"Question: {question}\n"
+        f"Student's answer: {answer}\n"
+        "Grade the answer's quality and note any misconception."
+    )
+    return prompt
+
+
 # The ONE LLM call in this file — everything else above is pure math.
 # Imports are placed INSIDE the function (lazy pattern, same as vectorstore.py):
 # ChatGoogleGenerativeAI and get_gemini_api_key() are only touched when this
 # function actually runs, so importing learner.py never requires an API key
 # and never fails just because Gemini isn't configured yet.
-def grade_answer(title: str, summary: str, question: str, answer: str):
+def grade_answer(title: str, summary: str, question: str, answer: str, reference: str = ""):
     from langchain_google_genai import ChatGoogleGenerativeAI
     from app.config import CHAT_MODEL, get_gemini_api_key
     from app.schemas import Grade
@@ -142,11 +230,5 @@ def grade_answer(title: str, summary: str, question: str, answer: str):
     # LangChain handles the schema enforcement under the hood.
     structured_llm = llm.with_structured_output(Grade)
 
-    prompt = (
-        f"You are grading a student's answer about '{title}'.\n"
-        f"Concept summary: {summary}\n"
-        f"Question: {question}\n"
-        f"Student's answer: {answer}\n"
-        "Grade the answer's quality and note any misconception."
-    )
+    prompt = build_grade_prompt(title, summary, question, answer, reference)
     return structured_llm.invoke(prompt)

@@ -36,6 +36,14 @@ CHAT_HISTORY_LIMIT=10
 MASTERY_ALPHA = 0.4
 MASTERY_THRESHOLD = 0.7
 BASE_REVIEW_INTERVAL_DAYS = 1
+# Answers at or above this quality count as passed. Separate from
+# MASTERY_THRESHOLD, which marks a whole concept as mastered.
+PASS_THRESHOLD = 0.6
+# After a failed answer the concept comes back sooner than a first pass
+# would (0.05 days is about 72 minutes).
+BASE_FAIL_INTERVAL_DAYS = 0.05
+# Max characters of retrieved course content handed to the grader.
+GRADER_CONTEXT_CHARS = 3000
 
 # def get_openai_api_key() -> str:
 #     key = os.getenv("OPENAI_API_KEY")

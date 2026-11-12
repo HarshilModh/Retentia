@@ -77,12 +77,16 @@ individual attempts, and grading must use the student's real words.
 - The grader receives the student's raw message. `take_turn` passes it through
   `RunnableConfig`; `grade_and_update` stops taking an `answer` argument from the LLM.
 - The grader prompt includes retrieved course chunks for the concept, not only the summary.
-- `Grade.quality` is bounded to 0.0–1.0 in the schema.
+- Quality is clamped to 0.0–1.0 in code (the pure grading update), not bounded in the
+  `Grade` schema: Gemini's handling of schema bounds is unverified and a rejected schema
+  would break all grading.
 - A failed attempt schedules the next review sooner than a pass does
   (`BASE_FAIL_INTERVAL_DAYS`, proposed 0.05 days as in `BUILD_PLAN.md`).
 - The pass line (currently a literal 0.6 in `apply_grade`) moves to `config.py`.
-- The frontend sends response time with each answer. Hints stay at 0 until a hint feature
-  exists.
+- Response time is measured by the server: `pose_question` stores when it asked, grading
+  takes the difference. No frontend change and the client cannot spoof it. It includes a
+  few seconds of agent latency, which is fine while nothing decides on it. Hints stay at 0
+  until a hint feature exists.
 
 **Acceptance**
 - Grading an answer adds exactly one attempt row holding the raw message text.

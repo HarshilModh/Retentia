@@ -62,9 +62,12 @@ cd frontend && npm run dev                            # npm run build = tsc --no
 ## Known gaps
 
 - **No migrations.** `init_db()` only calls `create_all`, which creates missing tables but
-  never alters existing ones. After changing a model, reset the dev database with
-  `docker compose down -v && docker compose up -d`, then re-seed. Alembic is out of scope
-  until there is data worth keeping.
+  never alters existing ones. A new table appears on the next start. A new column does not:
+  add it by hand with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` through
+  `docker exec userbox-postgres psql -U userbox -d userbox`. The dev database holds real chat
+  history and progress, so only reset it (`docker compose down -v && docker compose up -d`,
+  then `python ingest.py`) for a change that cannot be made additively, and ask first.
+  Alembic is out of scope until there is data worth keeping.
 - **No auth.** `user_id` is a string the client sends. Privacy is only as strong as that
   until auth is added.
 - **`take_turn` and `take_turn_stream` duplicate their setup.** Change both, or extract the

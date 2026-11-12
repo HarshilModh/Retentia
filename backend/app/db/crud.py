@@ -1,7 +1,7 @@
 from sqlalchemy import and_
 from sqlalchemy.dialects.postgresql import insert
 from app.db.session import SessionLocal
-from app.db.models import Concept, LearnerConcept, SessionState
+from app.db.models import Concept, LearnerConcept, SessionState, Attempt
 
 
 # Insert a concept or update it if the same id already exists
@@ -81,6 +81,24 @@ def upsert_learner_concept(user_id: str, concept_id: str, **fields):
     with SessionLocal() as session:
         session.execute(stmt)
         session.commit()
+
+
+# Save a graded answer: the updated progress row AND the attempt-log row, in
+# ONE session and ONE commit. If either write fails, neither is saved, so
+# progress can never change without a matching attempt record (and vice versa).
+# progress_fields -> columns of learner_concept; attempt_fields -> columns of attempts.
+def save_graded_attempt(user_id: str, concept_id: str, progress_fields: dict, attempt_fields: dict):
+    progress_stmt = insert(LearnerConcept).values(
+        user_id=user_id, concept_id=concept_id, **progress_fields
+    ).on_conflict_do_update(
+        index_elements=["user_id", "concept_id"],
+        set_=progress_fields,
+    )
+    with SessionLocal() as session:
+        # "with session.begin()" commits on success and rolls back on any error.
+        with session.begin():
+            session.execute(progress_stmt)
+            session.add(Attempt(user_id=user_id, concept_id=concept_id, **attempt_fields))
 
 
 # Fetch all concepts joined with this student's progress, filling defaults for untouched ones
@@ -175,5 +193,6 @@ def _session_to_dict(row: SessionState) -> dict:
         "user_id": row.user_id,
         "current_concept_id": row.current_concept_id,
         "pending_question": row.pending_question,
+        "question_posed_at": row.question_posed_at.isoformat() if row.question_posed_at else None,
         "chat_history": row.chat_history or []
     }

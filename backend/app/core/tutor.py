@@ -4,7 +4,15 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 
 from app.config import MAX_AGENT_STEPS, CHAT_HISTORY_LIMIT
 from app.core.retrieval import search_subject_kb, recall_persona as _recall_persona, save_memory as _save_memory
-from app.core.learner import apply_grade, select_next_concept as _select_next_concept, grade_answer
+from datetime import datetime, timezone
+
+from app.core.learner import (
+    apply_grade,
+    select_next_concept as _select_next_concept,
+    grade_answer,
+    build_grader_reference,
+    compute_response_ms,
+)
 from app.db.crud import get_session, upsert_session, get_concept, get_all_learner_concepts
 
 # Aliased imports (recall_persona -> _recall_persona, etc.) because the @tool
@@ -66,7 +74,13 @@ def pose_question(concept_id: str, question_text: str, config: RunnableConfig) -
             f"Error: '{concept_id}' is not a real concept id. Use one of the ids from "
             "get_learner_model or select_next_concept instead."
         )
-    upsert_session(user_id, current_concept_id=concept_id, pending_question=question_text)
+    # question_posed_at lets grading work out how long the student took to answer.
+    upsert_session(
+        user_id,
+        current_concept_id=concept_id,
+        pending_question=question_text,
+        question_posed_at=datetime.now(timezone.utc),
+    )
     return f"Question posed: {question_text}"
 
 
@@ -74,9 +88,17 @@ def pose_question(concept_id: str, question_text: str, config: RunnableConfig) -
 # output). Everything else here — the EMA math, streak/status update — is
 # deterministic Python from learner.py, not something the agent's LLM decides.
 @tool
-def grade_and_update(answer: str, config: RunnableConfig) -> str:
-    """Grade the learner's answer to the pending question and update their mastery."""
+def grade_and_update(config: RunnableConfig) -> str:
+    """Grade the learner's latest message as the answer to the pending question and update their mastery.
+    Takes no arguments: the learner's own message is graded automatically."""
     user_id = config["configurable"]["user_id"]
+    # The graded text is the student's actual message, injected by take_turn via
+    # the run config (same way as user_id). It is deliberately NOT a tool argument,
+    # so the LLM can never paraphrase or "improve" what gets graded.
+    answer = config["configurable"].get("user_message")
+    if not answer:
+        return "Error: no learner message available to grade."
+
     session = get_session(user_id)
     if not session or not session.get("pending_question"):
         return "No pending question to grade."
@@ -86,16 +108,35 @@ def grade_and_update(answer: str, config: RunnableConfig) -> str:
     if not concept:
         # Defensive fallback — should be unreachable now that pose_question validates
         # concept_id, but avoids a 500 if session state ever ends up inconsistent.
-        upsert_session(user_id, current_concept_id=concept_id, pending_question=None)
+        upsert_session(user_id, current_concept_id=concept_id, pending_question=None, question_posed_at=None)
         return f"Error: concept '{concept_id}' not found. Cleared the pending question — please pose a new one with a valid concept_id."
-    grade = grade_answer(concept["title"], concept["summary"], session["pending_question"], answer)
 
-    result = apply_grade(user_id, concept_id, grade.quality, grade.misconception)
+    question = session["pending_question"]
+    # Give the grader the actual course content for this concept, not just its
+    # one-line summary. Empty result -> the grader falls back to the summary.
+    docs = search_subject_kb(question, concept_id=concept_id)
+    reference = build_grader_reference([d.page_content for d in docs])
+
+    try:
+        grade = grade_answer(concept["title"], concept["summary"], question, answer, reference)
+    except Exception as e:
+        # Nothing was saved and the question stays pending, so the learner can
+        # simply send their answer again.
+        return (
+            f"Error: grading failed ({type(e).__name__}). No progress was changed and the "
+            "question is still pending. Ask the learner to send their answer again."
+        )
+
+    response_ms = compute_response_ms(session.get("question_posed_at"), datetime.now(timezone.utc))
+    result = apply_grade(
+        user_id, concept_id, grade.quality, grade.misconception,
+        question=question, answer=answer, response_ms=response_ms,
+    )
     # Clear pending_question so the next turn doesn't re-grade the same answer.
-    upsert_session(user_id, current_concept_id=concept_id, pending_question=None)
+    upsert_session(user_id, current_concept_id=concept_id, pending_question=None, question_posed_at=None)
 
     return (
-        f"Grade: {grade.quality:.2f}. {grade.explanation}\n"
+        f"Grade: {result['quality']:.2f}. {grade.explanation}\n"
         f"Mastery: {result['old_mastery']:.2f} -> {result['new_mastery']:.2f} "
         f"(status={result['status']}, streak={result['streak']}, next review in view)"
     )
@@ -153,7 +194,8 @@ SYSTEM_PROMPT = (
     "calling pose_question will never be graded, and the learner's progress "
     "will not update.\n\n"
     "Likewise, when the learner answers a pending question, you MUST call "
-    "grade_and_update BEFORE commenting on correctness. Never say \"correct\" "
+    "grade_and_update (it takes no arguments; it grades the learner's own message "
+    "automatically) BEFORE commenting on correctness. Never say \"correct\" "
     "or \"incorrect\" in your own words without calling grade_and_update first "
     "— only that tool computes the real mastery update. If grade_and_update "
     "returns \"No pending question to grade\", that means no question was "
@@ -189,7 +231,7 @@ def take_turn(user_id:str, message:str)->dict:
     result = agent.invoke(
         {"messages": messages},
         config={
-            "configurable": {"user_id": user_id},
+            "configurable": {"user_id": user_id, "user_message": message},
             "recursion_limit": 2 * MAX_AGENT_STEPS + 1,
         },
     )
@@ -259,7 +301,7 @@ async def take_turn_stream(user_id: str, message: str):
           {"messages": messages},
           version="v2",
           config={
-              "configurable": {"user_id": user_id},
+              "configurable": {"user_id": user_id, "user_message": message},
               "recursion_limit": 2 * MAX_AGENT_STEPS + 1,
           },
       ):  
